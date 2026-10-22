@@ -1,0 +1,11 @@
+node_modules/
+dist/
+client/dist/
+server/data/
+server/dist/
+server/.env
+client/.env
+*.tsbuildinfo
+.DS_Store
+
+server/tests/authorization.test.d.ts
