@@ -14,6 +14,8 @@ class FakePayments implements PaymentProvider {
   capturedStatus = "COMPLETED";
   captureCalls = 0;
   failCapture = false;
+  unverifiedCaptureResponse = false;
+  mismatchedOrderAfterCapture = false;
   lastCreateInput: {
     authorizationId: string;
     transactionId: string;
@@ -61,7 +63,15 @@ class FakePayments implements PaymentProvider {
     this.captureCalls += 1;
     if (this.failCapture) throw new Error("PayPal timed out");
     this.orderStatus = this.capturedStatus;
-    return await this.getOrder("sandbox-order-1");
+    const payment = await this.getOrder("sandbox-order-1");
+    if (this.mismatchedOrderAfterCapture) this.authorizationId = crypto.randomUUID();
+    if (this.unverifiedCaptureResponse) {
+      return {
+        ...payment,
+        purchase_units: payment.purchase_units?.map((unit) => ({ ...unit, custom_id: undefined, invoice_id: undefined, reference_id: undefined, amount: undefined })),
+      };
+    }
+    return payment;
   }
 }
 
@@ -282,14 +292,37 @@ describe("transaction-bound purchase authorization", () => {
     expect(payments.captureCalls).toBe(1);
   });
 
-  it("does not retry an ambiguous capture", async () => {
+  it("keeps an ambiguous capture pending without retrying it", async () => {
     const { body } = await authorize();
     await createOrder(body);
     payments.failCapture = true;
-    expect((await capture(body)).status).toBe(502);
+    expect((await capture(body)).status).toBe(202);
     expect(store.getAuthorization(body.id)?.status).toBe("capture_pending");
-    expect((await capture(body)).status).toBe(409);
+    expect((await capture(body)).status).toBe(202);
     expect(payments.captureCalls).toBe(1);
+  });
+
+  it("verifies an incomplete capture response against PayPal order details", async () => {
+    const { body } = await authorize();
+    await createOrder(body);
+    payments.unverifiedCaptureResponse = true;
+    const first = await capture(body);
+    expect(first.status).toBe(200);
+    expect(store.getAuthorization(body.id)?.status).toBe("consumed");
+    expect(payments.captureCalls).toBe(1);
+  });
+
+  it("does not consume an authorization when completed PayPal order metadata mismatches", async () => {
+    const { body } = await authorize();
+    await createOrder(body);
+    payments.mismatchedOrderAfterCapture = true;
+
+    const response = await capture(body);
+    expect(response.status).toBe(409);
+    expect((await response.json()).error.code).toBe("CAPTURE_MISMATCH");
+    expect(store.getAuthorization(body.id)?.status).toBe("capture_pending");
+    expect(payments.captureCalls).toBe(1);
+    expect(store.listAudit().some((event) => event.eventType === "payment.rejected.capture_mismatch" && event.authorizationId === body.id)).toBe(true);
   });
 
   it("keeps a pending capture unused and reconciles it when PayPal completes", async () => {

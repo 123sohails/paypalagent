@@ -199,9 +199,11 @@ function App() {
       `/authorizations/${encodeURIComponent(authorizationId)}/capture`,
       { method: "POST", body: JSON.stringify({ orderId }) },
     )
-      .then(({ authorization }) => {
+      .then(({ status: paymentStatus, authorization }) => {
         setActiveAuthorization(authorization);
-        setNotice("Payment verified. PayPal capture matches the transaction you approved.");
+        setNotice(paymentStatus === "PENDING"
+          ? "PayPal has not provided a verifiable final capture result yet. Check Sandbox activity before taking any further payment action."
+          : "Payment verified. PayPal capture matches the transaction you approved.");
         return refresh();
       })
       .catch((reason: unknown) => {

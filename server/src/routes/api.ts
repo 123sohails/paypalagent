@@ -235,6 +235,11 @@ export function createApiRouter(
       store.addAudit("payment.rejected.order_mismatch", authorization.id, "PayPal order failed authorization, amount, currency, or transaction verification");
       throw new ApiError(409, "PAYPAL_ORDER_MISMATCH", "PayPal order is not approved or does not match the authorized transaction.");
     }
+    if (authorization.status === "capture_pending") {
+      store.addAudit("payment.capture_pending", authorization.id, "PayPal order is still approved; no second capture was attempted");
+      response.status(202).json({ status: "PENDING", authorization: publicAuthorization(authorization) });
+      return;
+    }
     if (!store.transition(authorization.id, ["order_created"], "capturing")) {
       throw new ApiError(409, "CAPTURE_IN_PROGRESS", "A capture is already in progress or this authorization is no longer usable.");
     }
@@ -242,33 +247,59 @@ export function createApiRouter(
     let payment;
     try {
       payment = await payments.captureOrder(orderId.data, authorization.transactionId);
-    } catch (error) {
+    } catch {
       store.transition(authorization.id, ["capturing"], "capture_pending");
       store.addAudit("payment.capture_pending", authorization.id, "Capture response was unavailable; reconcile before retrying");
-      throw error;
+      response.status(202).json({
+        status: "PENDING",
+        authorization: publicAuthorization(store.getAuthorization(authorization.id)!),
+      });
+      return;
     }
-    if (!verifyCapturedPayment(payment, expected)) {
-      const captureStatus = payment.purchase_units?.[0]?.payments?.captures?.[0]?.status;
-      if (captureStatus === "PENDING" || payment.status === "PENDING") {
-        store.transition(authorization.id, ["capturing"], "capture_pending");
-        store.addAudit("payment.pending", authorization.id, "PayPal accepted the capture but reports it as pending");
-        response.status(202).json({ status: "PENDING", authorization: publicAuthorization(store.getAuthorization(authorization.id)!) });
-        return;
-      }
-      if (captureStatus === "DECLINED" || captureStatus === "FAILED") {
-        store.transition(authorization.id, ["capturing"], "failed");
-        store.addAudit("payment.failed", authorization.id, `PayPal capture returned ${captureStatus}`);
-        throw new ApiError(409, "PAYPAL_CAPTURE_FAILED", "PayPal did not complete the capture.");
-      }
+    const captureStatus = payment.purchase_units?.[0]?.payments?.captures?.[0]?.status;
+    if (captureStatus === "PENDING" || payment.status === "PENDING") {
       store.transition(authorization.id, ["capturing"], "capture_pending");
-      store.addAudit("payment.capture_pending", authorization.id, "PayPal capture result requires reconciliation");
-      throw new ApiError(502, "CAPTURE_RESULT_UNVERIFIED", "PayPal did not return a verified completed capture.");
+      store.addAudit("payment.pending", authorization.id, "PayPal accepted the capture but reports it as pending");
+      response.status(202).json({ status: "PENDING", authorization: publicAuthorization(store.getAuthorization(authorization.id)!) });
+      return;
+    }
+    if (captureStatus === "DECLINED" || captureStatus === "FAILED") {
+      store.transition(authorization.id, ["capturing"], "failed");
+      store.addAudit("payment.failed", authorization.id, `PayPal capture returned ${captureStatus}`);
+      throw new ApiError(409, "PAYPAL_CAPTURE_FAILED", "PayPal did not complete the capture.");
+    }
+
+    let verifiedOrder;
+    try {
+      verifiedOrder = await payments.getOrder(orderId.data);
+    } catch {
+      store.transition(authorization.id, ["capturing"], "capture_pending");
+      store.addAudit("payment.capture_pending", authorization.id, "Capture was requested; authoritative PayPal order details are unavailable for verification");
+      response.status(202).json({
+        status: "PENDING",
+        authorization: publicAuthorization(store.getAuthorization(authorization.id)!),
+      });
+      return;
+    }
+    if (verifiedOrder.status !== "COMPLETED") {
+      store.transition(authorization.id, ["capturing"], "capture_pending");
+      store.addAudit("payment.capture_pending", authorization.id, `PayPal order is ${verifiedOrder.status}; awaiting a verifiable completed capture`);
+      response.status(202).json({
+        status: "PENDING",
+        authorization: publicAuthorization(store.getAuthorization(authorization.id)!),
+      });
+      return;
+    }
+    if (!verifyCapturedPayment(verifiedOrder, expected)) {
+      store.transition(authorization.id, ["capturing"], "capture_pending");
+      store.addAudit("payment.rejected.capture_mismatch", authorization.id, "Completed PayPal payment did not match the approved transaction");
+      throw new ApiError(409, "CAPTURE_MISMATCH", "The completed PayPal payment does not match the approved transaction.");
     }
     if (!store.transition(authorization.id, ["capturing"], "consumed")) {
       throw new ApiError(409, "AUTHORIZATION_STATE_CHANGED", "Authorization state changed before capture could be finalized.");
     }
     store.addAudit("payment.verified", authorization.id, "PayPal capture verified against the approved transaction");
-    response.json({ status: payment.status, authorization: publicAuthorization(store.getAuthorization(authorization.id)!) });
+    response.json({ status: verifiedOrder.status, authorization: publicAuthorization(store.getAuthorization(authorization.id)!) });
   });
 
   router.post("/authorizations/:id/cancel", async (request, response) => {
