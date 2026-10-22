@@ -160,6 +160,7 @@ describe("transaction-bound purchase authorization", () => {
     });
     expect(response.status).toBe(403);
     expect((await response.json()).error.code).toBe("AMOUNT_EXCEEDS_LIMIT");
+    expect(store.listAudit().some((event) => event.eventType === "authorization.rejected.amount_exceeds_limit")).toBe(true);
   });
 
   it("rejects a product excluded from the allowed product list", async () => {
@@ -168,6 +169,7 @@ describe("transaction-bound purchase authorization", () => {
     expect(response.status).toBe(403);
     expect(body.error?.code).toBe("PRODUCT_NOT_ALLOWED");
     expect(body.id).toBeUndefined();
+    expect(store.listAudit().some((event) => event.eventType === "authorization.rejected.product_not_allowed")).toBe(true);
   });
 
   it("rejects a product from a merchant excluded by policy", async () => {
@@ -175,6 +177,7 @@ describe("transaction-bound purchase authorization", () => {
     const { response, body } = await authorize("headphones-001");
     expect(response.status).toBe(403);
     expect(body.error?.code).toBe("MERCHANT_NOT_ALLOWED");
+    expect(store.listAudit().some((event) => event.eventType === "authorization.rejected.merchant_not_allowed")).toBe(true);
   });
 
   it("rejects a purchase above the configured amount limit", async () => {
@@ -182,6 +185,7 @@ describe("transaction-bound purchase authorization", () => {
     const { response, body } = await authorize("headphones-001");
     expect(response.status).toBe(403);
     expect(body.error?.code).toBe("AMOUNT_EXCEEDS_LIMIT");
+    expect(store.listAudit().some((event) => event.eventType === "authorization.rejected.amount_exceeds_limit")).toBe(true);
   });
 
   it("rejects a catalog product whose currency differs from policy", async () => {
@@ -190,6 +194,7 @@ describe("transaction-bound purchase authorization", () => {
     const { response, body } = await authorize("headphones-001");
     expect(response.status).toBe(403);
     expect(body.error?.code).toBe("CURRENCY_NOT_ALLOWED");
+    expect(store.listAudit().some((event) => event.eventType === "authorization.rejected.currency_not_allowed")).toBe(true);
   });
 
   it("returns the same authorization for a replayed approval key", async () => {
@@ -225,6 +230,7 @@ describe("transaction-bound purchase authorization", () => {
     }
     expect(store.getAuthorization(body.id)?.status).toBe("expired");
     expect(payments.lastCreateInput).toBeUndefined();
+    expect(store.listAudit().some((event) => event.eventType === "authorization.expired" && event.authorizationId === body.id)).toBe(true);
   });
 
   it("expires an authorization before PayPal capture", async () => {
@@ -240,6 +246,7 @@ describe("transaction-bound purchase authorization", () => {
     }
     expect(store.getAuthorization(body.id)?.status).toBe("expired");
     expect(payments.captureCalls).toBe(0);
+    expect(store.listAudit().some((event) => event.eventType === "authorization.expired" && event.authorizationId === body.id)).toBe(true);
   });
 
   it("does not capture an order whose PayPal amount has changed", async () => {
@@ -251,6 +258,7 @@ describe("transaction-bound purchase authorization", () => {
     expect((await response.json()).error.code).toBe("PAYPAL_ORDER_MISMATCH");
     expect(payments.captureCalls).toBe(0);
     expect(store.getAuthorization(body.id)?.status).toBe("order_created");
+    expect(store.listAudit().some((event) => event.eventType === "payment.rejected.order_mismatch" && event.authorizationId === body.id)).toBe(true);
   });
 
   it("does not capture an order associated with another authorization", async () => {

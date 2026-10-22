@@ -43,6 +43,17 @@ type Proposal = {
   explanation: string;
   provider: string;
 };
+type SecurityRejection = {
+  code: string;
+  message: string;
+  product: Product | null;
+};
+
+class ApiError extends Error {
+  constructor(message: string, public readonly code: string) {
+    super(message);
+  }
+}
 
 const apiBase = import.meta.env.VITE_API_URL ?? "/api";
 
@@ -54,7 +65,7 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const body = await response.json();
   if (!response.ok) {
     const message = body?.error?.message ?? `Request failed (${response.status})`;
-    throw new Error(message);
+    throw new ApiError(message, body?.error?.code ?? "REQUEST_FAILED");
   }
   return body as T;
 }
@@ -63,14 +74,78 @@ function money(amountMinor: number, currency: string): string {
   return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(amountMinor / 100);
 }
 
+function policyReason(product: Product, policy: Policy | null): string | null {
+  if (!policy) return "Purchase rules are still loading.";
+  if (!policy.allowedProductIds.includes(product.id)) return "Product is not on the allowed-products list.";
+  if (!policy.allowedMerchantIds.includes(product.merchantId)) return "Merchant is not on the allowed-merchants list.";
+  if (product.amountMinor > policy.maxAmountMinor) return `Exceeds your ${money(policy.maxAmountMinor, policy.currency)} per-purchase limit.`;
+  if (product.currency !== policy.currency) return `Product is ${product.currency}; your policy requires ${policy.currency}.`;
+  return null;
+}
+
+function authorizationLabel(status: string): string {
+  const labels: Record<string, string> = {
+    authorized: "Approval recorded",
+    order_created: "Awaiting PayPal approval",
+    capturing: "Verifying payment",
+    capture_pending: "Capture pending reconciliation",
+    consumed: "Payment captured & verified",
+    failed: "Payment failed",
+    cancelled: "Checkout cancelled",
+    expired: "Approval expired",
+  };
+  return labels[status] ?? "Transaction status unavailable";
+}
+
+function auditLabel(eventType: string): string {
+  const labels: Record<string, string> = {
+    "authorization.created": "Authorization created",
+    "authorization.expired": "Authorization expired",
+    "policy.updated": "Purchase rules updated",
+    "payment.order_created": "PayPal order created",
+    "payment.capture_started": "Capture verification started",
+    "payment.verified": "Capture verified",
+    "payment.capture_pending": "Capture pending reconciliation",
+    "payment.pending": "Payment pending",
+    "payment.failed": "Payment failed",
+    "payment.cancelled": "Checkout cancelled",
+    "payment.rejected.order_mismatch": "PayPal order rejected",
+    "payment.rejected.capture_mismatch": "Completed payment rejected",
+    "authorization.rejected.product_not_allowed": "Product blocked by policy",
+    "authorization.rejected.merchant_not_allowed": "Merchant blocked by policy",
+    "authorization.rejected.amount_exceeds_limit": "Purchase blocked by budget",
+    "authorization.rejected.currency_not_allowed": "Currency blocked by policy",
+    "authorization.rejected.transaction_mismatch": "Transaction integrity check failed",
+  };
+  return labels[eventType] ?? eventType.replaceAll(".", " ").replaceAll("_", " ");
+}
+
+function rejectionLabel(code: string): string {
+  const labels: Record<string, string> = {
+    PRODUCT_NOT_ALLOWED: "Product is not allowed by your policy.",
+    MERCHANT_NOT_ALLOWED: "Merchant is not allowed by your policy.",
+    AMOUNT_EXCEEDS_LIMIT: "Purchase exceeds your spending limit.",
+    CURRENCY_NOT_ALLOWED: "Product currency does not match your policy.",
+    AUTHORIZATION_EXPIRED: "This approval expired before payment processing.",
+    ORDER_MISMATCH: "PayPal order is not bound to this approved transaction.",
+    PAYPAL_ORDER_MISMATCH: "PayPal order did not match the transaction you approved.",
+    CAPTURE_MISMATCH: "Completed payment did not match the saved authorization.",
+    IDEMPOTENCY_KEY_REUSED: "This approval key was already used for a different transaction.",
+  };
+  return labels[code] ?? "The server rejected this transaction.";
+}
+
 function App() {
   const [catalog, setCatalog] = useState<Product[]>([]);
   const [policy, setPolicy] = useState<Policy | null>(null);
+  const [savedPolicy, setSavedPolicy] = useState<Policy | null>(null);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [prompt, setPrompt] = useState("");
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [activeAuthorization, setActiveAuthorization] = useState<Authorization | null>(null);
+  const [reviewProduct, setReviewProduct] = useState<Product | null>(null);
+  const [securityRejection, setSecurityRejection] = useState<SecurityRejection | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -85,6 +160,7 @@ function App() {
     ]);
     setCatalog(products);
     setPolicy(rules);
+    setSavedPolicy(rules);
     setAudit(events);
     setStatus(appStatus);
   }, []);
@@ -128,7 +204,12 @@ function App() {
         setNotice("Payment verified. PayPal capture matches the transaction you approved.");
         return refresh();
       })
-      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Could not verify the PayPal payment."))
+      .catch((reason: unknown) => {
+        setError(reason instanceof Error ? reason.message : "Could not verify the PayPal payment.");
+        if (reason instanceof ApiError) {
+          setSecurityRejection({ code: reason.code, message: reason.message, product: null });
+        }
+      })
       .finally(() => {
         setBusy(false);
         window.history.replaceState({}, "", "/");
@@ -162,6 +243,8 @@ function App() {
     setBusy(true);
     setError("");
     setNotice("");
+    setSecurityRejection(null);
+    setReviewProduct(null);
     try {
       const approvalKey = crypto.randomUUID();
       const authorization = await api<Authorization>("/authorizations", {
@@ -178,9 +261,13 @@ function App() {
         `/authorizations/${encodeURIComponent(authorization.id)}/order`,
         { method: "POST", body: "{}" },
       );
+      setActiveAuthorization({ ...authorization, status: "order_created" });
       window.location.assign(order.approveUrl);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not authorize this purchase.");
+      if (reason instanceof ApiError) {
+        setSecurityRejection({ code: reason.code, message: reason.message, product: item });
+      }
       await refresh().catch(() => undefined);
     } finally {
       setBusy(false);
@@ -203,6 +290,7 @@ function App() {
         }),
       });
       setPolicy(updated);
+      setSavedPolicy(updated);
       setPolicyDirty(false);
       setNotice(`Purchase rules saved as policy version ${updated.version}.`);
       await refresh();
@@ -249,12 +337,13 @@ function App() {
           <span>agentguard<span className="brand-dot">.</span></span>
         </a>
         <div className="topbar-right">
-          <span className="environment"><i /> Sandbox workspace</span>
+          <nav className="top-nav" aria-label="Main navigation"><a href="#dashboard">Dashboard</a><a href="#activity">Activity</a></nav>
+          <span className="environment"><i /> Sandbox</span>
           <div className="avatar">S</div>
         </div>
       </header>
 
-      <main className="page">
+      <main className="page" id="dashboard">
         <section className="hero">
           <div>
             <div className="eyebrow"><span className="eyebrow-line" /> INTENTLOCK PROTECTION</div>
@@ -271,8 +360,8 @@ function App() {
 
         <section className="status-row" aria-label="Service status">
           <div className="status-item"><span className="status-icon">✦</span><span>AI agent</span><strong>{status?.aiProvider && status.aiProvider !== "local-catalog" ? `${status.aiProvider} configured` : "Catalog mode"}</strong><span className="status-dot" /></div>
-          <div className="status-item"><span className="paypal-mark">P</span><span>PayPal</span><strong>{status?.paypalSandboxConfigured ? "Sandbox ready" : "Not configured"}</strong><span className={`status-dot ${status?.paypalSandboxConfigured ? "active" : ""}`} /></div>
-          <div className="status-item"><span className="status-icon">▤</span><span>Audit trail</span><strong>Recording</strong><span className="status-dot active" /></div>
+          <div className="status-item"><span className="paypal-mark">P</span><span>PayPal</span><strong>{status?.paypalSandboxConfigured ? "Sandbox configured" : "Not configured"}</strong><span className={`status-dot ${status?.paypalSandboxConfigured ? "active" : ""}`} /></div>
+          <div className="status-item"><span className="status-icon">▤</span><span>Persistence</span><strong>{status?.persistence ?? "Checking…"}</strong><span className={`status-dot ${status?.persistence ? "active" : ""}`} /></div>
         </section>
 
         {(error || notice) && (
@@ -324,12 +413,8 @@ function App() {
               ) : (
                 <div className="product-grid">
                   {shownProducts.map((product, index) => {
-                    const allowed = Boolean(
-                      policy?.allowedProductIds.includes(product.id)
-                      && policy.allowedMerchantIds.includes(product.merchantId)
-                      && product.amountMinor <= (policy?.maxAmountMinor ?? 0)
-                      && product.currency === policy?.currency,
-                    );
+                    const blockReason = policyReason(product, savedPolicy);
+                    const allowed = blockReason === null;
                     return (
                       <article className={`product-card ${proposal?.product?.id === product.id ? "featured-card" : ""}`} key={product.id}>
                         <div className="product-image">
@@ -341,13 +426,16 @@ function App() {
                           <div className="product-merchant">{product.merchantName}</div>
                           <h3>{product.name}</h3>
                           <p>{product.description}</p>
+                          <div className={`policy-result ${allowed ? "policy-allowed" : "policy-blocked"}`}>
+                            <span>{allowed ? "✓" : "!"}</span>
+                            <span>{allowed ? "Within current server policy" : blockReason}</span>
+                          </div>
                           <div className="product-footer">
                             <strong>{money(product.amountMinor, product.currency)}</strong>
-                            <button className="button button-outline" disabled={busy || !allowed} onClick={() => approve(product)}>
-                              {allowed ? "Review & approve" : "Blocked by rules"} <span>→</span>
+                            <button className="button button-outline" disabled={busy || !allowed} onClick={() => setReviewProduct(product)}>
+                              {allowed ? "Review purchase" : "Not permitted"} <span>→</span>
                             </button>
                           </div>
-                          {!allowed && <div className="blocked-note">Not permitted by your current purchase rules</div>}
                         </div>
                       </article>
                     );
@@ -357,12 +445,24 @@ function App() {
             </section>
 
             {activeAuthorization && (
-              <section className="authorization-card">
-                <div className="authorization-check">✓</div>
+              <section className={`authorization-card status-${activeAuthorization.status}`}>
+                <div className="authorization-check">{activeAuthorization.status === "consumed" ? "✓" : activeAuthorization.status === "failed" || activeAuthorization.status === "expired" ? "!" : "·"}</div>
                 <div><span className="step-label">TRANSACTION-BOUND APPROVAL</span><h3>{activeAuthorization.product?.name ?? "Purchase approval"}</h3>
                   <p>{money(activeAuthorization.amountMinor, activeAuthorization.currency)} · Expires {new Date(activeAuthorization.expiresAt).toLocaleTimeString()}</p>
-                  <code>AUTH {activeAuthorization.id.slice(0, 8).toUpperCase()} · {activeAuthorization.status}</code>
+                  <code>AUTH {activeAuthorization.id.slice(0, 8).toUpperCase()} · {authorizationLabel(activeAuthorization.status)}</code>
                 </div>
+              </section>
+            )}
+            {securityRejection && (
+              <section className="security-rejection" role="alert">
+                <div className="rejection-mark">!</div>
+                <div>
+                  <span className="step-label">SERVER SECURITY DECISION · {securityRejection.code}</span>
+                  <h3>Transaction rejected</h3>
+                  <p>{rejectionLabel(securityRejection.code)} {securityRejection.message}</p>
+                  {securityRejection.product && <small>Attempted item: {securityRejection.product.name} · {securityRejection.product.merchantName} · {money(securityRejection.product.amountMinor, securityRejection.product.currency)}.</small>}
+                </div>
+                <button onClick={() => setSecurityRejection(null)} aria-label="Dismiss rejection">×</button>
               </section>
             )}
           </div>
@@ -371,12 +471,14 @@ function App() {
             <section className="panel rules-panel">
               <div className="panel-heading compact">
                 <div><span className="step-label">YOUR GUARDRAILS</span><h2>Purchase rules</h2></div>
-                <span className="version-pill">V{policy?.version ?? "—"}</span>
+                <span className="version-pill">V{savedPolicy?.version ?? "—"}</span>
               </div>
               {policy && (
                 <form onSubmit={savePolicy}>
                   <label className="field-label" htmlFor="limit">MAX PER PURCHASE</label>
                   <div className="money-input"><span>{policy.currency === "USD" ? "$" : policy.currency}</span><input id="limit" type="number" min="1" max="1000000" step="1" value={policy.maxAmountMinor / 100} onChange={(event) => { setPolicy({ ...policy, maxAmountMinor: Math.round(Number(event.target.value || 0) * 100) }); setPolicyDirty(true); }} /><select aria-label="Policy currency" value={policy.currency} onChange={(event) => { setPolicy({ ...policy, currency: event.target.value }); setPolicyDirty(true); }}><option value="USD">USD</option><option value="EUR">EUR</option><option value="GBP">GBP</option></select></div>
+                  <div className="policy-summary"><span>{policyDirty ? "Saved server-enforced cap" : "Current server-enforced cap"}</span><strong>{savedPolicy ? money(savedPolicy.maxAmountMinor, savedPolicy.currency) : "Loading…"}</strong></div>
+                  {policyDirty && <p className="unsaved-policy-note">Draft edits are not enforced until saved.</p>}
                   <div className="rule-divider" />
                   <div className="field-label">ALLOWED MERCHANTS</div>
                   <div className="check-list">
@@ -393,27 +495,60 @@ function App() {
               )}
             </section>
 
-            <section className="panel audit-panel">
+            <section className="panel audit-panel" id="activity">
               <div className="panel-heading compact">
                 <div><span className="step-label">LIVE ACTIVITY</span><h2>Audit trail</h2></div>
-                <span className="live-indicator"><i /> LIVE</span>
+                <span className="live-indicator"><i /> RECENT</span>
               </div>
               <div className="audit-list">
                 {audit.slice(0, 5).map((event) => (
                   <div className="audit-event" key={event.id}>
                     <span className={`audit-icon ${event.eventType.includes("rejected") ? "audit-warn" : ""}`}>{event.eventType.includes("verified") ? "✓" : event.eventType.includes("rejected") ? "!" : "·"}</span>
-                    <div><strong>{event.eventType.replaceAll(".", " ").replaceAll("_", " ")}</strong><p>{event.detail}</p><time>{new Date(event.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></div>
+                    <div><strong>{auditLabel(event.eventType)}</strong><p>{event.detail}</p><time dateTime={event.createdAt}>{new Date(event.createdAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</time></div>
                   </div>
                 ))}
                 {audit.length === 0 && <p className="audit-empty">Your security events will appear here.</p>}
               </div>
-              <div className="audit-footer"><span>Stored locally in SQLite</span><span>●</span></div>
+              <div className="audit-footer"><span>SQLite-backed · retention depends on host storage</span><span>●</span></div>
             </section>
           </aside>
         </div>
 
         <footer className="page-footer"><span>AGENTGUARD <b>·</b> INTENTLOCK</span><span>AI proposes. You approve. The server verifies.</span><span>DEMO ENVIRONMENT</span></footer>
       </main>
+
+      {reviewProduct && (
+        <div className="review-overlay" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setReviewProduct(null);
+        }}>
+          <section
+            className="review-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="review-title"
+            onKeyDown={(event) => { if (event.key === "Escape") setReviewProduct(null); }}
+          >
+            <div className="dialog-topline"><span className="step-label">FINAL CHECK · USER APPROVAL REQUIRED</span><button onClick={() => setReviewProduct(null)} aria-label="Close transaction review">×</button></div>
+            <h2 id="review-title">Review your purchase</h2>
+            <p className="dialog-intro">Only approve if these exact transaction details are what you intend to buy.</p>
+            <div className="review-item">
+              <img src={reviewProduct.imageUrl} alt="" />
+              <div><span className="product-merchant">{reviewProduct.merchantName}</span><h3>{reviewProduct.name}</h3><p>{reviewProduct.description}</p></div>
+            </div>
+            <div className="review-total"><span>Total · {reviewProduct.currency}</span><strong>{money(reviewProduct.amountMinor, reviewProduct.currency)}</strong></div>
+            <div className="review-checks">
+              <div><span>✓</span><p><strong>Current policy</strong><small>The server checks product, merchant, currency, and amount again when you approve.</small></p></div>
+              <div><span>✓</span><p><strong>Transaction-bound authorization</strong><small>A new approval is tied to this exact item and expires in 10 minutes.</small></p></div>
+              <div><span>✓</span><p><strong>PayPal verification</strong><small>The Sandbox order must match the saved authorization before capture.</small></p></div>
+            </div>
+            <div className="dialog-actions">
+              <button className="button button-outline dialog-cancel" onClick={() => setReviewProduct(null)}>Go back</button>
+              <button className="button button-dark dialog-approve" autoFocus disabled={busy} onClick={() => approve(reviewProduct)}>{busy ? "Checking rules…" : "Approve this exact transaction"} <span>→</span></button>
+            </div>
+            <p className="dialog-disclaimer">Sandbox environment. Once issued, this authorization cannot be edited.</p>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

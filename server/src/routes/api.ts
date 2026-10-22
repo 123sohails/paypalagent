@@ -45,7 +45,9 @@ function policyRejection(product: (typeof catalog)[number], policy: Policy): str
 
 function assertUsableAuthorization(authorization: Authorization, store: Store): void {
   if (Date.parse(authorization.expiresAt) <= Date.now()) {
-    store.transition(authorization.id, ["authorized", "order_created"], "expired");
+    if (store.transition(authorization.id, ["authorized", "order_created"], "expired")) {
+      store.addAudit("authorization.expired", authorization.id, "Expired approval was blocked before payment processing");
+    }
     throw new ApiError(409, "AUTHORIZATION_EXPIRED", "This approval has expired. Approve the purchase again.");
   }
   const product = catalog.find(({ id }) => id === authorization.productId);
@@ -55,10 +57,18 @@ function assertUsableAuthorization(authorization: Authorization, store: Store): 
     || product.amountMinor !== authorization.amountMinor
     || product.currency !== authorization.currency
   ) {
+    store.addAudit(
+      "authorization.rejected.transaction_mismatch",
+      authorization.id,
+      "Saved transaction no longer matches the trusted catalog record",
+    );
     throw new ApiError(409, "TRANSACTION_MISMATCH", "The approved transaction no longer matches the catalog.");
   }
   const reason = policyRejection(product, store.getPolicy());
-  if (reason) throw new ApiError(403, reason, "Current purchase rules do not permit this transaction.");
+  if (reason) {
+    store.addAudit(`authorization.rejected.${reason.toLowerCase()}`, authorization.id, "Current purchase rules blocked this transaction");
+    throw new ApiError(403, reason, "Current purchase rules do not permit this transaction.");
+  }
 }
 
 function publicAuthorization(authorization: Authorization) {
@@ -125,7 +135,11 @@ export function createApiRouter(
     const policy = store.getPolicy();
     const rejection = policyRejection(product, policy);
     if (rejection) {
-      store.addAudit(`authorization.rejected.${rejection.toLowerCase()}`, null, `Product ${product.id} rejected by policy`);
+      store.addAudit(
+        `authorization.rejected.${rejection.toLowerCase()}`,
+        null,
+        `Policy blocked ${product.name} from ${product.merchantName}`,
+      );
       throw new ApiError(403, rejection, "Purchase rules do not permit this transaction.");
     }
     const result = store.createAuthorization({
@@ -176,6 +190,7 @@ export function createApiRouter(
     if (!authorization) throw new ApiError(404, "AUTHORIZATION_NOT_FOUND", "Authorization not found.");
     assertUsableAuthorization(authorization, store);
     if (!authorization.orderId || authorization.orderId !== orderId.data) {
+      store.addAudit("payment.rejected.order_mismatch", authorization.id, "Capture request referenced an order not bound to this authorization");
       throw new ApiError(409, "ORDER_MISMATCH", "This PayPal order does not belong to the approved transaction.");
     }
     if (authorization.status === "consumed") {
@@ -206,6 +221,7 @@ export function createApiRouter(
         return;
       }
       if (!verifyCapturedPayment(order, expected)) {
+        store.addAudit("payment.rejected.capture_mismatch", authorization.id, "Completed PayPal payment did not match the authorized transaction");
         throw new ApiError(409, "CAPTURE_MISMATCH", "The completed PayPal payment does not match the approved transaction.");
       }
       if (!store.transition(authorization.id, ["order_created", "capturing", "capture_pending"], "consumed")) {
@@ -216,6 +232,7 @@ export function createApiRouter(
       return;
     }
     if (order.status !== "APPROVED" || !verifyPayPalOrder(order, expected)) {
+      store.addAudit("payment.rejected.order_mismatch", authorization.id, "PayPal order failed authorization, amount, currency, or transaction verification");
       throw new ApiError(409, "PAYPAL_ORDER_MISMATCH", "PayPal order is not approved or does not match the authorized transaction.");
     }
     if (!store.transition(authorization.id, ["order_created"], "capturing")) {
